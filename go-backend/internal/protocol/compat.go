@@ -194,7 +194,22 @@ func AnthropicMessage(body map[string]any, chat ConversationStreamer, accounts I
 func ImageUsage(prompt string, count int) map[string]any {
 	input := CountTextTokens(prompt, "gpt-image-1")
 	output := 1056 * count
-	return map[string]any{"input_tokens": input, "output_tokens": output, "total_tokens": input + output}
+	total := input + output
+	return map[string]any{
+		"input_tokens":      input,
+		"output_tokens":     output,
+		"prompt_tokens":     input,
+		"completion_tokens": output,
+		"total_tokens":      total,
+		"input_tokens_details": map[string]any{
+			"text_tokens":  input,
+			"image_tokens": 0,
+		},
+		"output_tokens_details": map[string]any{
+			"text_tokens":  0,
+			"image_tokens": output,
+		},
+	}
 }
 
 func responsePrompt(input any, instructions any) string {

@@ -903,6 +903,16 @@ func TestDirectImageGenerationSupportsB64JSON(t *testing.T) {
 	if len(items) != 1 || items[0].(map[string]any)["b64_json"] != "Y2F0" {
 		t.Fatalf("data = %#v", body["data"])
 	}
+	usage := body["usage"].(map[string]any)
+	if usage["completion_tokens"] != float64(1056) || usage["output_tokens"] != float64(1056) {
+		t.Fatalf("usage output tokens = %#v", usage)
+	}
+	if usage["prompt_tokens"].(float64) <= 0 || usage["input_tokens"].(float64) <= 0 {
+		t.Fatalf("usage input tokens = %#v", usage)
+	}
+	if usage["total_tokens"] != usage["prompt_tokens"].(float64)+usage["completion_tokens"].(float64) {
+		t.Fatalf("usage total tokens = %#v", usage)
+	}
 }
 
 func TestDirectImageGenerationUploadsToImgbedWhenEnabled(t *testing.T) {
@@ -1228,6 +1238,13 @@ func TestImageEditEndpointsSupportMultipart(t *testing.T) {
 	data = imageBody["data"].([]any)
 	if len(data) != 1 || data[0].(map[string]any)["b64_json"] != "Y2F0" {
 		t.Fatalf("openai edit body = %#v", imageBody)
+	}
+	usage := imageBody["usage"].(map[string]any)
+	if usage["completion_tokens"] != float64(1056) || usage["output_tokens"] != float64(1056) {
+		t.Fatalf("openai edit usage output tokens = %#v", usage)
+	}
+	if usage["prompt_tokens"].(float64) <= 0 || usage["input_tokens"].(float64) <= 0 {
+		t.Fatalf("openai edit usage input tokens = %#v", usage)
 	}
 }
 

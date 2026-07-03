@@ -733,15 +733,13 @@ func (a *App) handleImagesGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
-	a.local.Images().SaveHistoryRecord("/v1/images/generations", "generate", body.Model, body.Prompt, data, map[string]any{
-		"input_tokens":  0,
-		"output_tokens": 0,
-		"total_tokens":  0,
-	})
+	usage := protocol.ImageUsage(body.Prompt, len(data))
+	a.local.Images().SaveHistoryRecord("/v1/images/generations", "generate", body.Model, body.Prompt, data, usage)
 	a.logEvent("call", "图片生成成功", map[string]any{"model": body.Model, "size": body.Size, "count": len(data)})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"created": time.Now().Unix(),
 		"data":    imageResponseData(data, responseFormat),
+		"usage":   usage,
 	})
 }
 
@@ -853,15 +851,13 @@ func (a *App) handleImagesEdits(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
-	a.local.Images().SaveHistoryRecord("/v1/images/edits", "edit", model, prompt, data, map[string]any{
-		"input_tokens":  0,
-		"output_tokens": 0,
-		"total_tokens":  0,
-	})
+	usage := protocol.ImageUsage(prompt, len(data))
+	a.local.Images().SaveHistoryRecord("/v1/images/edits", "edit", model, prompt, data, usage)
 	a.logEvent("call", "图片编辑成功", map[string]any{"model": model, "size": size, "image_count": len(inputs), "count": len(data)})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"created": time.Now().Unix(),
 		"data":    imageResponseData(data, responseFormat),
+		"usage":   usage,
 	})
 }
 
