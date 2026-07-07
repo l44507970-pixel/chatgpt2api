@@ -10,6 +10,11 @@ func TestDomainReputationRecordsHardSoftAndSuccess(t *testing.T) {
 		t.Fatalf("hard failure record = %#v", hard)
 	}
 
+	disallowed := store.RecordFailure("yyds_mail", "blocked.example", `create_account_http_400, detail={"error":{"code":"registration_disallowed","message":"Sorry, we cannot create your account with the given information."}}`)
+	if disallowed["bucket"] != "hard" || disallowed["disabled"] != true || disallowed["disabled_changed"] != true {
+		t.Fatalf("registration_disallowed failure record = %#v", disallowed)
+	}
+
 	soft := store.RecordFailure("yyds_mail", "soft.example", "等待注册验证码超时")
 	if soft["bucket"] != "soft" || soft["disabled"] == true {
 		t.Fatalf("soft failure record = %#v", soft)
@@ -22,8 +27,14 @@ func TestDomainReputationRecordsHardSoftAndSuccess(t *testing.T) {
 
 	store.RecordSuccess("yyds_mail", "winner.example")
 	preferred := store.PreferredDomains("yyds_mail", []string{"winner.example", "soft.example"})
-	if len(preferred) != 1 || preferred[0] != "winner.example" {
+	wantPreferred := []string{"winner.example", "soft.example"}
+	if len(preferred) != len(wantPreferred) {
 		t.Fatalf("preferred domains = %#v", preferred)
+	}
+	for i := range wantPreferred {
+		if preferred[i] != wantPreferred[i] {
+			t.Fatalf("preferred domains = %#v, want %#v", preferred, wantPreferred)
+		}
 	}
 }
 

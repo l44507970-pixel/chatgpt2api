@@ -12,7 +12,9 @@ import (
 var hardFailureMarkers = []string{
 	"unsupported_email",
 	"account_creation_failed",
+	"registration_disallowed",
 	"The email you provided is not supported",
+	"Sorry, we cannot create your account with the given information.",
 	"Failed to create account. Please try again.",
 }
 
@@ -150,17 +152,15 @@ func (s *domainReputationStore) PreferredDomains(provider string, domains []stri
 	if len(scored) == 0 {
 		return nil
 	}
-	best := scored[0].score
-	for _, item := range scored[1:] {
-		if item.score > best {
-			best = item.score
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
 		}
-	}
-	out := []string{}
+		return scored[i].domain < scored[j].domain
+	})
+	out := make([]string, 0, len(scored))
 	for _, item := range scored {
-		if item.score == best {
-			out = append(out, item.domain)
-		}
+		out = append(out, item.domain)
 	}
 	return out
 }

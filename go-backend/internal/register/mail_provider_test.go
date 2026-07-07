@@ -37,6 +37,29 @@ func TestYydsSelectDomainExploreAndReputation(t *testing.T) {
 	}
 }
 
+func TestYydsSelectDomainRotatesConfiguredDomainsWithReputation(t *testing.T) {
+	store := newDomainReputationStore(t.TempDir() + "/mail_domain_reputation.json")
+	store.RecordSuccess("yyds_mail", "winner.example")
+
+	provider := &yydsMailProvider{
+		baseMailProvider: baseMailProvider{entry: map[string]any{
+			"domain":              []string{"fresh.example", "winner.example", "other.example"},
+			"domain_learning":     true,
+			"domain_explore_rate": 0,
+		}},
+		reputation: store,
+	}
+
+	resetMailDomainSeq()
+	got := []string{provider.selectDomain(), provider.selectDomain(), provider.selectDomain()}
+	want := []string{"winner.example", "fresh.example", "other.example"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rotated domains = %#v, want %#v", got, want)
+		}
+	}
+}
+
 func TestYydsSelectDomainReturnsEmptyWhenAllCandidatesDisabled(t *testing.T) {
 	store := newDomainReputationStore(t.TempDir() + "/mail_domain_reputation.json")
 	store.RecordFailure("yyds_mail", "disabled.example", "account_creation_failed")
