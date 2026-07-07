@@ -631,6 +631,15 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*
 	// 生成 SO token（Sentinel Observer），仅在 oauth_create_account 阶段需要
 	var soToken string
 	if flow == "oauth_create_account" {
+		keys := make([]string, 0, len(payload))
+		for k := range payload {
+			keys = append(keys, k)
+		}
+		w.service.appendLog(
+			fmt.Sprintf("[任务%d] Sentinel resp keys=%v, has_so=%v, so=%v",
+				w.index, keys, payload["so"] != nil, payload["so"]),
+			"info",
+		)
 		soData := asMap(payload["so"])
 		if boolValue(soData["required"], false) && clean(soData["seed"]) != "" {
 			// 按官方前端逻辑等待 5000ms 采集 observer 数据
