@@ -606,7 +606,8 @@ func (w *registerWorker) authSessionWorkspaceID() string {
 
 func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*sentinelTokens, error) {
 	generator := newSentinelTokenGenerator(w.deviceID, registerUserAgent)
-	reqPayload := map[string]any{"p": generator.generateRequirementsToken(), "id": w.deviceID, "flow": flow}
+	reqsToken := generator.generateRequirementsToken()
+	reqPayload := map[string]any{"p": reqsToken, "id": w.deviceID, "flow": flow}
 	body, err := compactJSONBytes(reqPayload)
 	if err != nil {
 		return nil, err
@@ -646,7 +647,7 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*
 		if boolValue(soData["required"], false) && clean(soData["collector_dx"]) != "" {
 			// 按官方前端逻辑等待 5000ms 采集 observer 数据
 			time.Sleep(5000 * time.Millisecond)
-			soToken = clean(soData["collector_dx"])
+			soToken = generateSOTokenFromCollectorDX(clean(soData["collector_dx"]), reqsToken)
 			w.service.appendLog(
 				fmt.Sprintf("[任务%d] Sentinel SO token 已生成: collector_dx_len=%d, has_snapshot=%v",
 					w.index, len(soToken), clean(soData["snapshot_dx"]) != ""),
@@ -1228,4 +1229,119 @@ func randomChoiceInt(values []int) int {
 		return 0
 	}
 	return values[mathrand.Intn(len(values))]
+}
+
+// ── Sentinel Observer VM ──────────────────────────────────
+func xorDecrypt(data, key string) string {
+	var buf strings.Builder
+	kl := len(key)
+	if kl == 0 { return data }
+	for i := 0; i < len(data); i++ { buf.WriteByte(data[i] ^ key[i%kl]) }
+	return buf.String()
+}
+
+type sentinelObsVM struct {
+	regs     map[string]any
+	queue    []any
+	counter  int
+	finished bool
+}
+
+func newSentinelObsVM() *sentinelObsVM {
+	vm := &sentinelObsVM{regs: map[string]any{}}
+	r := vm.regs
+	r["1"] = func(a []any) { vm.set(a, xorDecrypt(fmt.Sprint(vm.get(a[0])), fmt.Sprint(vm.get(a[1])))) }
+	r["2"] = func(a []any) { vm.set(a, vm.get(a[1])) }
+	r["5"] = func(a []any) { v := vm.get(a[1]); switch e := vm.get(a[0]).(type) { case []any: vm.set(a, append(e, v)); default: vm.set(a, fmt.Sprint(e)+fmt.Sprint(v)) } }
+	r["6"] = func(a []any) { b := vm.get(a[1]); idx := vm.get(a[2]); switch bb := b.(type) { case string: if n, ok := toInt(idx); ok && n >= 0 && n < len(bb) { vm.set(a, string(bb[n])) }; case []any: if n, ok := toInt(idx); ok && n >= 0 && n < len(bb) { vm.set(a, bb[n]) } } }
+	r["7"] = func(a []any) { fn := vm.get(a[0]); fa := make([]any, len(a)-1); for i := 1; i < len(a); i++ { fa[i-1] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } }
+	r["8"] = func(a []any) { vm.set(a, vm.get(a[1])) }
+	r["12"] = func(a []any) { vm.set(a, r) }
+	r["13"] = func(a []any) { func() { defer func() { if rc := recover(); rc != nil { vm.set(a, fmt.Sprint(rc)) } }(); fn := vm.get(a[1]); fa := make([]any, len(a)-2); for i := 2; i < len(a); i++ { fa[i-2] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } }() }
+	r["14"] = func(a []any) { var res any; if json.Unmarshal([]byte(fmt.Sprint(vm.get(a[1]))), &res) == nil { vm.set(a, res) } }
+	r["15"] = func(a []any) { d, _ := compactJSONBytes(vm.get(a[1])); vm.set(a, string(d)) }
+	r["17"] = func(a []any) { fn := vm.get(a[1]); fa := make([]any, len(a)-2); for i := 2; i < len(a); i++ { fa[i-2] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } }
+	r["18"] = func(a []any) { d, _ := base64.StdEncoding.DecodeString(fmt.Sprint(vm.get(a[0]))); vm.set(a, string(d)) }
+	r["19"] = func(a []any) { vm.set(a, base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(vm.get(a[0]))))) }
+	r["20"] = func(a []any) { if fmt.Sprint(vm.get(a[0])) == fmt.Sprint(vm.get(a[1])) { fn := vm.get(a[2]); fa := make([]any, len(a)-3); for i := 3; i < len(a); i++ { fa[i-3] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } } }
+	r["22"] = func(a []any) { if sl, ok := vm.get(a[1]).([]any); ok { sq := vm.queue; vm.queue = make([]any, len(sl)); copy(vm.queue, sl); vm.run(); vm.set(a, fmt.Sprint(vm.counter)); vm.queue = sq } }
+	r["23"] = func(a []any) { if vm.get(a[0]) != nil { fn := vm.get(a[1]); fa := make([]any, len(a)-2); for i := 2; i < len(a); i++ { fa[i-2] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } } }
+	r["24"] = func(a []any) { obj, method := vm.get(a[1]), vm.get(a[2]); vm.set(a, func(fa []any) { if o, ok := obj.(string); ok && fmt.Sprint(method) == "indexOf" { vm.set(a, strings.Index(o, fmt.Sprint(fa[0]))) } }) }
+	for _, op := range []string{"25","26","27","28"} { r[op] = func(a []any) {} }
+	r["29"] = func(a []any) { av, _ := toFloat(vm.get(a[1])); bv, _ := toFloat(vm.get(a[2])); vm.set(a, av < bv) }
+	r["33"] = func(a []any) { av, _ := toFloat(vm.get(a[1])); bv, _ := toFloat(vm.get(a[2])); vm.set(a, av*bv) }
+	r["34"] = func(a []any) { vm.set(a, vm.get(a[1])) }
+	return vm
+}
+
+func (vm *sentinelObsVM) get(key any) any {
+	switch k := key.(type) {
+	case string: return vm.regs[k]
+	case float64: return vm.regs[fmt.Sprint(int(k))]
+	default: return vm.regs[fmt.Sprint(k)]
+	}
+}
+
+func (vm *sentinelObsVM) set(args []any, val any) {
+	if len(args) > 0 { vm.regs[fmt.Sprint(args[0])] = val }
+}
+
+func (vm *sentinelObsVM) run() {
+	for len(vm.queue) > 0 {
+		inst := vm.queue[0]; vm.queue = vm.queue[1:]
+		if ia, ok := inst.([]any); ok && len(ia) > 0 {
+			if fn, ok := vm.regs[fmt.Sprint(ia[0])].(func([]any)); ok { fn(ia) }
+		}
+		vm.counter++
+	}
+}
+
+func generateSOTokenFromCollectorDX(collectorDX, proofToken string) string {
+	raw, err := base64.StdEncoding.DecodeString(collectorDX)
+	if err != nil { return "" }
+	decrypted := xorDecrypt(string(raw), proofToken)
+	var program []any
+	if json.Unmarshal([]byte(decrypted), &program) != nil { return "" }
+	vm := newSentinelObsVM()
+	vm.regs["rt"] = proofToken
+	ch := make(chan string, 1)
+	vm.regs["3"] = func(a []any) { if !vm.finished { vm.finished = true; ch <- base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(vm.get(a[0])))) } }
+	vm.regs["4"] = func(a []any) { if !vm.finished { vm.finished = true; ch <- base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(vm.get(a[0])))) } }
+	vm.regs["30"] = func(a []any) {
+		fnName := fmt.Sprint(a[0]); pn := a[1:]; ac := len(pn) - 1; body := a[len(a)-1]
+		vm.regs[fnName] = func(ca []any) {
+			saved := map[string]any{}
+			for k, v := range vm.regs { saved[k] = v }
+			for i := 0; i < ac && i < len(ca); i++ { vm.regs[fmt.Sprint(pn[i])] = ca[i] }
+			if bl, ok := body.([]any); ok { sq := vm.queue; vm.queue = make([]any, len(bl)); copy(vm.queue, bl); vm.run(); vm.queue = sq }
+			for k := range vm.regs { if _, ok := saved[k]; !ok { delete(vm.regs, k) } }
+			for k, v := range saved { vm.regs[k] = v }
+		}
+	}
+	vm.queue = make([]any, len(program)); copy(vm.queue, program)
+	vm.run()
+	select {
+	case result := <-ch: return result
+	case <-time.After(500 * time.Millisecond): return base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%d", vm.counter)))
+	}
+}
+
+func toInt(v any) (int, bool) {
+	switch v := v.(type) {
+	case float64: return int(v), true
+	case int: return v, true
+	case json.Number: n, e := v.Int64(); return int(n), e == nil
+	case string: n, e := strconv.Atoi(v); return n, e == nil
+	}
+	return 0, false
+}
+
+func toFloat(v any) (float64, bool) {
+	switch v := v.(type) {
+	case float64: return v, true
+	case int: return float64(v), true
+	case json.Number: n, e := v.Float64(); return n, e == nil
+	case string: n, e := strconv.ParseFloat(v, 64); return n, e == nil
+	}
+	return 0, false
 }
