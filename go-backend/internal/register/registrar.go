@@ -69,6 +69,11 @@ type registerWorker struct {
 	deviceID string
 }
 
+type sentinelTokens struct {
+	token   string
+	soToken string
+}
+
 type sentinelTokenGenerator struct {
 	deviceID  string
 	userAgent string
@@ -140,6 +145,9 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	if err := w.platformAuthorize(ctx, email); err != nil {
 		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
 	}
+	if err := w.authorizeContinueForRegistration(ctx, email); err != nil {
+		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
+	}
 	if err := w.registerUser(ctx, email, password); err != nil {
 		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
 	}
@@ -192,14 +200,39 @@ func (w *registerWorker) platformAuthorize(ctx context.Context, email string) er
 	return nil
 }
 
-func (w *registerWorker) registerUser(ctx context.Context, email, password string) error {
-	w.step("开始提交注册密码")
+// authorizeContinueForRegistration 在注册流程中补齐 authorize/continue 步骤。
+// 浏览器真实注册流程在 GET authorize 后先 POST authorize/continue 提交邮箱，
+// 然后才 POST user/register 提交密码。缺少这一步会导致 create_account 阶段
+// 被风控拒绝（registration_disallowed）。
+func (w *registerWorker) authorizeContinueForRegistration(ctx context.Context, email string) error {
+	w.step("开始 authorize/continue（注册流程邮箱提交）")
 	headers := w.jsonHeaders(registerAuthBase + "/create-account/password")
-	token, err := w.buildSentinelToken(ctx, "username_password_create")
+	tokens, err := w.buildSentinelToken(ctx, "authorize_continue")
 	if err != nil {
 		return err
 	}
-	headers["openai-sentinel-token"] = token
+	headers["openai-sentinel-token"] = tokens.token
+	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/authorize/continue", map[string]any{
+		"username": map[string]any{"kind": "email", "value": email},
+	}, headers, true)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK && status != http.StatusFound {
+		return fmt.Errorf("authorize_continue_reg_http_%d%s", status, responseDetail(payload))
+	}
+	w.step("authorize/continue 完成")
+	return nil
+}
+
+func (w *registerWorker) registerUser(ctx context.Context, email, password string) error {
+	w.step("开始提交注册密码")
+	headers := w.jsonHeaders(registerAuthBase + "/create-account/password")
+	tokens, err := w.buildSentinelToken(ctx, "username_password_create")
+	if err != nil {
+		return err
+	}
+	headers["openai-sentinel-token"] = tokens.token
 	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/user/register", map[string]any{
 		"username": email,
 		"password": password,
@@ -242,11 +275,19 @@ func (w *registerWorker) validateOTP(ctx context.Context, code string) error {
 func (w *registerWorker) createAccount(ctx context.Context, name, birthdate string) error {
 	w.step("开始创建账号资料")
 	headers := w.jsonHeaders(registerAuthBase + "/about-you")
-	token, err := w.buildSentinelToken(ctx, "oauth_create_account")
+	tokens, err := w.buildSentinelToken(ctx, "oauth_create_account")
 	if err != nil {
 		return err
 	}
-	headers["openai-sentinel-token"] = token
+	headers["openai-sentinel-token"] = tokens.token
+	if tokens.soToken != "" {
+		headers["openai-sentinel-so-token"] = tokens.soToken
+		w.service.appendLog(
+			fmt.Sprintf("[任务%d] create_account 携带 SO token: sentinel_len=%d, so_len=%d",
+				w.index, len(tokens.token), len(tokens.soToken)),
+			"info",
+		)
+	}
 	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/create_account", map[string]any{
 		"name":      name,
 		"birthdate": birthdate,
@@ -336,11 +377,11 @@ func (w *registerWorker) loginAndExchangeTokens(ctx context.Context, email, pass
 	}
 	w.step("邮箱提交完成")
 	headers := w.jsonHeaders(registerAuthBase + "/log-in/password")
-	token, err := w.buildSentinelToken(ctx, "password_verify")
+	st, err := w.buildSentinelToken(ctx, "password_verify")
 	if err != nil {
 		return nil, err
 	}
-	headers["openai-sentinel-token"] = token
+	headers["openai-sentinel-token"] = st.token
 	status, payload, err = w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/password/verify", map[string]any{
 		"password": password,
 	}, headers, false)
@@ -425,11 +466,11 @@ func (w *registerWorker) replaceRegisterSession(deviceID string) (*http.Client, 
 func (w *registerWorker) submitLoginEmail(ctx context.Context, email string) (int, map[string]any, error) {
 	w.step("开始提交邮箱")
 	headers := w.jsonHeaders(registerAuthBase + "/log-in?usernameKind=email")
-	token, err := w.buildSentinelToken(ctx, "authorize_continue")
+	tokens, err := w.buildSentinelToken(ctx, "authorize_continue")
 	if err != nil {
 		return 0, nil, err
 	}
-	headers["openai-sentinel-token"] = token
+	headers["openai-sentinel-token"] = tokens.token
 	return w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/authorize/continue", map[string]any{
 		"username": map[string]any{"kind": "email", "value": email},
 	}, headers, false)
@@ -483,11 +524,11 @@ func (w *registerWorker) validateOTPCode(ctx context.Context, code string) (map[
 		return payload, nil
 	}
 	headers := w.jsonHeaders(registerAuthBase + "/email-verification")
-	token, tokenErr := w.buildSentinelToken(ctx, "authorize_continue")
+	tokens, tokenErr := w.buildSentinelToken(ctx, "authorize_continue")
 	if tokenErr != nil {
 		return nil, fmt.Errorf("validate_otp_http_%d; sentinel fallback failed: %w", status, tokenErr)
 	}
-	headers["openai-sentinel-token"] = token
+	headers["openai-sentinel-token"] = tokens.token
 	status, payload, err = w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/email-otp/validate", map[string]any{"code": code}, headers, true)
 	if err != nil {
 		return nil, err
@@ -589,20 +630,20 @@ func (w *registerWorker) authSessionWorkspaceID() string {
 	return clean(workspaces[0]["id"])
 }
 
-func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (string, error) {
+func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*sentinelTokens, error) {
 	generator := newSentinelTokenGenerator(w.deviceID, registerUserAgent)
 	reqPayload := map[string]any{"p": generator.generateRequirementsToken(), "id": w.deviceID, "flow": flow}
 	body, err := compactJSONBytes(reqPayload)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	status, payload, err := w.requestRawJSON(ctx, http.MethodPost, registerSentinelBase+"/backend-api/sentinel/req", body, sentinelHeaders())
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	challengeToken := clean(payload["token"])
 	if status != http.StatusOK || challengeToken == "" {
-		return "", fmt.Errorf("sentinel_req_failed_%d", status)
+		return nil, fmt.Errorf("sentinel_req_failed_%d", status)
 	}
 	proof := asMap(payload["proofofwork"])
 	pValue := generator.generateRequirementsToken()
@@ -612,9 +653,28 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (s
 	tokenPayload := map[string]any{"p": pValue, "t": "", "c": challengeToken, "id": w.deviceID, "flow": flow}
 	data, err := compactJSONBytes(tokenPayload)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return string(data), nil
+
+	// 生成 SO token（Sentinel Observer），用于 create_account 阶段
+	var soToken string
+	soData := asMap(payload["so"])
+	if boolValue(soData["required"], false) && clean(soData["seed"]) != "" {
+		// 按官方前端逻辑等待 5000ms 采集 observer 数据
+		time.Sleep(5000 * time.Millisecond)
+		soToken = generator.generateSOToken(clean(soData["seed"]), firstNonEmpty(clean(soData["difficulty"]), "0"))
+		w.service.appendLog(
+			fmt.Sprintf("[任务%d] Sentinel SO token 已生成: len=%d, sdk=%s",
+				w.index, len(soToken), registerSentinelSDK),
+			"info",
+		)
+	} else {
+		w.service.appendLog(
+			fmt.Sprintf("[任务%d] Sentinel 响应中无 SO requirements（so.required=false 或 seed 为空），跳过 SO token 生成", w.index),
+			"info",
+		)
+	}
+	return &sentinelTokens{token: string(data), soToken: soToken}, nil
 }
 
 func (w *registerWorker) requestRawJSON(ctx context.Context, method, target string, body []byte, headers map[string]string) (int, map[string]any, error) {
@@ -1012,6 +1072,33 @@ func (g *sentinelTokenGenerator) config() []any {
 	}
 }
 
+// soConfig 生成 SO (Sentinel Observer) 专用配置，与普通 config 的主要区别：
+// - 模拟 5000ms 的浏览器采集期
+// - 使用不同的 navigator/document key 集合
+func (g *sentinelTokenGenerator) soConfig() []any {
+	observerPerfNow := 5000 + mathrand.Float64()*500
+	return []any{
+		"1920x1080",
+		time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 GMT+0000 (Coordinated Universal Time)"),
+		int64(4294705152),
+		mathrand.Float64(),
+		g.userAgent,
+		registerSentinelSDK,
+		nil,
+		nil,
+		"en-US",
+		mathrand.Float64(),
+		randomChoice([]string{"hardwareConcurrency-undefined", "deviceMemory-undefined", "jsHeapSizeLimit-undefined", "totalJSHeapSize-undefined"}),
+		randomChoice([]string{"cookieEnabled", "doNotTrack", "onLine", "pdfViewerEnabled"}),
+		randomChoice([]string{"Intl", "ArrayBuffer", "Uint8Array", "Float64Array", "BigInt64Array"}),
+		observerPerfNow,
+		g.sid,
+		"",
+		randomChoiceInt([]int{4, 8, 12, 16}),
+		float64(time.Now().UnixMilli()) - observerPerfNow,
+	}
+}
+
 func (g *sentinelTokenGenerator) generateRequirementsToken() string {
 	data := g.config()
 	data[3] = 1
@@ -1036,6 +1123,29 @@ func (g *sentinelTokenGenerator) generateToken(seed, difficulty string) string {
 		}
 	}
 	return "gAAAAAB" + registerSentinelErrorPrefix + base64JSON("None")
+}
+
+// generateSOToken 生成 SO (Sentinel Observer) token。
+// 与 generateToken 的区别：
+// 1. 使用 soConfig 而非 config（模拟 5000ms 采集周期）
+// 2. 在生成前已等待 observerDuration（由调用方控制）
+func (g *sentinelTokenGenerator) generateSOToken(seed, difficulty string) string {
+	start := time.Now()
+	data := g.soConfig()
+	if difficulty == "" {
+		difficulty = "0"
+	}
+	for i := 0; i < registerSentinelMaxAttempts; i++ {
+		data[3] = i
+		data[9] = round1(float64(time.Since(start).Milliseconds()))
+		payload := base64JSON(data)
+		hash := fnv1a32(seed + payload)
+		prefixLen := minInt(len(difficulty), len(hash))
+		if hash[:prefixLen] <= difficulty[:prefixLen] {
+			return "gAAAAAB" + payload + "~S"
+		}
+	}
+	return "gAAAAAB" + registerSentinelErrorPrefix + base64JSON("so_none")
 }
 
 func base64JSON(value any) string {
