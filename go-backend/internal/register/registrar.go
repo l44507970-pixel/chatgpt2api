@@ -145,9 +145,6 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	if err := w.platformAuthorize(ctx, email); err != nil {
 		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
 	}
-	if err := w.authorizeContinueForRegistration(ctx, email); err != nil {
-		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
-	}
 	if err := w.registerUser(ctx, email, password); err != nil {
 		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
 	}
@@ -197,31 +194,6 @@ func (w *registerWorker) platformAuthorize(ctx context.Context, email string) er
 		return fmt.Errorf("platform_authorize_http_%d%s", status, authorizeErrorDetail(payload))
 	}
 	w.step("platform authorize 完成")
-	return nil
-}
-
-// authorizeContinueForRegistration 在注册流程中补齐 authorize/continue 步骤。
-// 浏览器真实注册流程在 GET authorize 后先 POST authorize/continue 提交邮箱，
-// 然后才 POST user/register 提交密码。缺少这一步会导致 create_account 阶段
-// 被风控拒绝（registration_disallowed）。
-func (w *registerWorker) authorizeContinueForRegistration(ctx context.Context, email string) error {
-	w.step("开始 authorize/continue（注册流程邮箱提交）")
-	headers := w.jsonHeaders(registerAuthBase + "/create-account/password")
-	tokens, err := w.buildSentinelToken(ctx, "authorize_continue")
-	if err != nil {
-		return err
-	}
-	headers["openai-sentinel-token"] = tokens.token
-	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/authorize/continue", map[string]any{
-		"username": map[string]any{"kind": "email", "value": email},
-	}, headers, true)
-	if err != nil {
-		return err
-	}
-	if status != http.StatusOK && status != http.StatusFound {
-		return fmt.Errorf("authorize_continue_reg_http_%d%s", status, responseDetail(payload))
-	}
-	w.step("authorize/continue 完成")
 	return nil
 }
 
@@ -656,23 +628,25 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*
 		return nil, err
 	}
 
-	// 生成 SO token（Sentinel Observer），用于 create_account 阶段
+	// 生成 SO token（Sentinel Observer），仅在 oauth_create_account 阶段需要
 	var soToken string
-	soData := asMap(payload["so"])
-	if boolValue(soData["required"], false) && clean(soData["seed"]) != "" {
-		// 按官方前端逻辑等待 5000ms 采集 observer 数据
-		time.Sleep(5000 * time.Millisecond)
-		soToken = generator.generateSOToken(clean(soData["seed"]), firstNonEmpty(clean(soData["difficulty"]), "0"))
-		w.service.appendLog(
-			fmt.Sprintf("[任务%d] Sentinel SO token 已生成: len=%d, sdk=%s",
-				w.index, len(soToken), registerSentinelSDK),
-			"info",
-		)
-	} else {
-		w.service.appendLog(
-			fmt.Sprintf("[任务%d] Sentinel 响应中无 SO requirements（so.required=false 或 seed 为空），跳过 SO token 生成", w.index),
-			"info",
-		)
+	if flow == "oauth_create_account" {
+		soData := asMap(payload["so"])
+		if boolValue(soData["required"], false) && clean(soData["seed"]) != "" {
+			// 按官方前端逻辑等待 5000ms 采集 observer 数据
+			time.Sleep(5000 * time.Millisecond)
+			soToken = generator.generateSOToken(clean(soData["seed"]), firstNonEmpty(clean(soData["difficulty"]), "0"))
+			w.service.appendLog(
+				fmt.Sprintf("[任务%d] Sentinel SO token 已生成: len=%d, sdk=%s",
+					w.index, len(soToken), registerSentinelSDK),
+				"info",
+			)
+		} else {
+			w.service.appendLog(
+				fmt.Sprintf("[任务%d] Sentinel 响应中无 SO requirements（so.required=false 或 seed 为空），跳过 SO token 生成", w.index),
+				"info",
+			)
+		}
 	}
 	return &sentinelTokens{token: string(data), soToken: soToken}, nil
 }
