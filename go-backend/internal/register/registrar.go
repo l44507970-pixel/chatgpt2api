@@ -270,6 +270,8 @@ func (w *registerWorker) createAccount(ctx context.Context, name, birthdate stri
 	if status != http.StatusOK && status != http.StatusFound {
 		if failedToCreateAccount(payload) {
 			w.step("创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名")
+		} else if registrationDisallowed(payload) {
+			w.step("创建账号失败提示: 上游拒绝这组注册信息，通常与邮箱域名、代理 IP 或注册频率风控有关")
 		}
 		return fmt.Errorf("create_account_http_%d%s", status, responseDetail(payload))
 	}
@@ -932,6 +934,11 @@ func failedToCreateAccount(payload map[string]any) bool {
 	return clean(payload["message"]) == "Failed to create account. Please try again."
 }
 
+func registrationDisallowed(payload map[string]any) bool {
+	errPayload := asMap(payload["error"])
+	return clean(errPayload["code"]) == "registration_disallowed"
+}
+
 func randomPassword(length int) string {
 	if length < 8 {
 		length = 8
@@ -1033,6 +1040,8 @@ func newSentinelTokenGenerator(deviceID, userAgent string) *sentinelTokenGenerat
 
 func (g *sentinelTokenGenerator) config() []any {
 	perfNow := 1000 + mathrand.Float64()*49000
+	timeOrigin := float64(time.Now().UnixMilli()) - perfNow
+	searchParams := fmt.Sprintf("device_id=%s,flow=,screen_hint=login_or_signup", g.deviceID)
 	return []any{
 		"1920x1080",
 		time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 GMT+0000 (Coordinated Universal Time)"),
@@ -1040,18 +1049,18 @@ func (g *sentinelTokenGenerator) config() []any {
 		mathrand.Float64(),
 		g.userAgent,
 		registerSentinelSDK,
-		nil,
-		nil,
+		"",
 		"en-US",
+		"en-US,en,es-US,es",
 		mathrand.Float64(),
 		randomChoice([]string{"vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"}),
 		randomChoice([]string{"location", "implementation", "URL", "documentURI", "compatMode"}),
 		randomChoice([]string{"Object", "Function", "Array", "Number", "parseFloat", "undefined"}),
 		perfNow,
 		g.sid,
-		"",
+		searchParams,
 		randomChoiceInt([]int{4, 8, 12, 16}),
-		float64(time.Now().UnixMilli()) - perfNow,
+		timeOrigin,
 	}
 }
 
@@ -1060,6 +1069,8 @@ func (g *sentinelTokenGenerator) config() []any {
 // - 使用不同的 navigator/document key 集合
 func (g *sentinelTokenGenerator) soConfig() []any {
 	observerPerfNow := 5000 + mathrand.Float64()*500
+	timeOrigin := float64(time.Now().UnixMilli()) - observerPerfNow
+	searchParams := fmt.Sprintf("device_id=%s,flow=,screen_hint=login_or_signup", g.deviceID)
 	return []any{
 		"1920x1080",
 		time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 GMT+0000 (Coordinated Universal Time)"),
@@ -1067,18 +1078,18 @@ func (g *sentinelTokenGenerator) soConfig() []any {
 		mathrand.Float64(),
 		g.userAgent,
 		registerSentinelSDK,
-		nil,
-		nil,
+		"",
 		"en-US",
+		"en-US,en,es-US,es",
 		mathrand.Float64(),
 		randomChoice([]string{"hardwareConcurrency-undefined", "deviceMemory-undefined", "jsHeapSizeLimit-undefined", "totalJSHeapSize-undefined"}),
 		randomChoice([]string{"cookieEnabled", "doNotTrack", "onLine", "pdfViewerEnabled"}),
 		randomChoice([]string{"Intl", "ArrayBuffer", "Uint8Array", "Float64Array", "BigInt64Array"}),
 		observerPerfNow,
 		g.sid,
-		"",
+		searchParams,
 		randomChoiceInt([]int{4, 8, 12, 16}),
-		float64(time.Now().UnixMilli()) - observerPerfNow,
+		timeOrigin,
 	}
 }
 
