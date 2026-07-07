@@ -643,18 +643,18 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*
 			"info",
 		)
 		soData := asMap(payload["so"])
-		if boolValue(soData["required"], false) && clean(soData["seed"]) != "" {
+		if boolValue(soData["required"], false) && clean(soData["collector_dx"]) != "" {
 			// 按官方前端逻辑等待 5000ms 采集 observer 数据
 			time.Sleep(5000 * time.Millisecond)
-			soToken = generator.generateSOToken(clean(soData["seed"]), firstNonEmpty(clean(soData["difficulty"]), "0"))
+			soToken = clean(soData["collector_dx"])
 			w.service.appendLog(
-				fmt.Sprintf("[任务%d] Sentinel SO token 已生成: len=%d, sdk=%s",
-					w.index, len(soToken), registerSentinelSDK),
+				fmt.Sprintf("[任务%d] Sentinel SO token 已生成: collector_dx_len=%d, has_snapshot=%v",
+					w.index, len(soToken), clean(soData["snapshot_dx"]) != ""),
 				"info",
 			)
 		} else {
 			w.service.appendLog(
-				fmt.Sprintf("[任务%d] Sentinel 响应中无 SO requirements（so.required=false 或 seed 为空），跳过 SO token 生成", w.index),
+				fmt.Sprintf("[任务%d] Sentinel so 字段无有效的 collector_dx（required=%v, has_collector=%v）", w.index, soData["required"], clean(soData["collector_dx"]) != ""),
 				"info",
 			)
 		}
