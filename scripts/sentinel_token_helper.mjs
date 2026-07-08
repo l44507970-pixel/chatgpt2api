@@ -526,6 +526,7 @@ async function main() {
   const needSO = Boolean(input.need_so);
   const loaderUrl = String(input.loader_url || DEFAULT_LOADER_URL);
   const proxyURL = normalizeProxy(input.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "");
+  const pageUrl = String(input.page_url || "").trim();
   const sdkFetch = makeFetch(proxyURL);
   const commonHeaders = {
     "user-agent": userAgent,
@@ -543,9 +544,9 @@ async function main() {
   const sdkVersion = sdkUrl.match(/\/sentinel\/([^/]+)\/sdk\.js$/)?.[1] || "";
   const sdkSource = await fetchText(sdkUrl, commonHeaders);
   const frameUrl = `${SENTINEL_BASE}/backend-api/sentinel/frame.html?sv=${encodeURIComponent(sdkVersion)}`;
-  const parentUrl = `${AUTH_BASE}/create-account?device_id=${encodeURIComponent(
-    deviceId,
-  )}&flow=&screen_hint=login_or_signup`;
+  const parentUrl = pageUrl
+    ? (pageUrl.startsWith("http") ? pageUrl : `${AUTH_BASE}${pageUrl.startsWith("/") ? "" : "/"}${pageUrl}`)
+    : `${AUTH_BASE}/create-account?device_id=${encodeURIComponent(deviceId)}&flow=&screen_hint=login_or_signup`;
 
   const frameFetch = (url, options = {}) =>
     fetch(url, {

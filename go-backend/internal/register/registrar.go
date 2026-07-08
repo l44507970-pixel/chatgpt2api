@@ -63,13 +63,14 @@ func (e *attemptError) Domain() string {
 }
 
 type registerWorker struct {
-	service  *Service
-	index    int
-	config   map[string]any
-	mail     map[string]any
-	factory  *mailProviderFactory
-	client   *http.Client
-	deviceID string
+	service     *Service
+	index       int
+	config      map[string]any
+	mail        map[string]any
+	factory     *mailProviderFactory
+	client      *http.Client
+	deviceID    string
+	continueURL string
 }
 
 type sentinelTokens struct {
@@ -215,12 +216,21 @@ func (w *registerWorker) platformAuthorize(ctx context.Context, email string) er
 
 func (w *registerWorker) registerUser(ctx context.Context, email, password string) error {
 	w.step("开始提交注册密码")
+	pageURL := "create-account/password"
+	if w.continueURL != "" {
+		pageURL = w.continueURL
+	}
 	headers := w.jsonHeaders(registerAuthBase + "/create-account/password")
-	tokens, err := w.buildSentinelToken(ctx, "username_password_create")
+	tokens, err := w.buildSentinelToken(ctx, "username_password_create", pageURL)
 	if err != nil {
 		return err
 	}
 	headers["OpenAI-Sentinel-Token"] = tokens.token
+	w.service.appendLog(
+		fmt.Sprintf("[任务%d] 提交注册密码 page_url=%s, sentinel_len=%d",
+			w.index, pageURL, len(tokens.token)),
+		"info",
+	)
 	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/user/register", map[string]any{
 		"username": email,
 		"password": password,
@@ -240,10 +250,11 @@ func (w *registerWorker) registerUser(ctx context.Context, email, password strin
 
 func (w *registerWorker) submitRegisterEmail(ctx context.Context, email string) error {
 	w.step("开始提交注册邮箱")
+	w.continueURL = ""
 	var lastPayload map[string]any
 	for attempt := 0; attempt < 2; attempt++ {
 		headers := w.jsonHeaders(registerAuthBase + "/log-in?usernameKind=email")
-		tokens, err := w.buildSentinelToken(ctx, "authorize_continue")
+		tokens, err := w.buildSentinelToken(ctx, "authorize_continue", "create-account")
 		if err != nil {
 			return err
 		}
@@ -268,6 +279,13 @@ func (w *registerWorker) submitRegisterEmail(ctx context.Context, email string) 
 			}
 			return fmt.Errorf("register_email_submit_http_%d%s", status, responseDetail(payload))
 		}
+		w.continueURL = clean(payload["continue_url"])
+		pageType := clean(asMap(payload["page"])["type"])
+		w.service.appendLog(
+			fmt.Sprintf("[任务%d] 注册邮箱提交完成, page_type=%s, continue_url=%s",
+				w.index, pageType, firstNonEmpty(w.continueURL, "(空)")),
+			"info",
+		)
 		w.step("注册邮箱提交完成")
 		return nil
 	}
@@ -299,7 +317,7 @@ func (w *registerWorker) validateOTP(ctx context.Context, code string) error {
 func (w *registerWorker) createAccount(ctx context.Context, name, birthdate string) error {
 	w.step("开始创建账号资料")
 	headers := w.jsonHeaders(registerAuthBase + "/about-you")
-	tokens, err := w.buildSentinelToken(ctx, "oauth_create_account")
+	tokens, err := w.buildSentinelToken(ctx, "oauth_create_account", "about-you")
 	if err != nil {
 		return err
 	}
@@ -405,7 +423,7 @@ func (w *registerWorker) loginAndExchangeTokens(ctx context.Context, email, pass
 	}
 	w.step("邮箱提交完成")
 	headers := w.jsonHeaders(registerAuthBase + "/log-in/password")
-	st, err := w.buildSentinelToken(ctx, "password_verify")
+	st, err := w.buildSentinelToken(ctx, "password_verify", "log-in/password")
 	if err != nil {
 		return nil, err
 	}
@@ -494,7 +512,7 @@ func (w *registerWorker) replaceRegisterSession(deviceID string) (*http.Client, 
 func (w *registerWorker) submitLoginEmail(ctx context.Context, email string) (int, map[string]any, error) {
 	w.step("开始提交邮箱")
 	headers := w.jsonHeaders(registerAuthBase + "/log-in?usernameKind=email")
-	tokens, err := w.buildSentinelToken(ctx, "authorize_continue")
+	tokens, err := w.buildSentinelToken(ctx, "authorize_continue", "log-in")
 	if err != nil {
 		return 0, nil, err
 	}
@@ -552,7 +570,7 @@ func (w *registerWorker) validateOTPCode(ctx context.Context, code string) (map[
 		return payload, nil
 	}
 	headers := w.jsonHeaders(registerAuthBase + "/email-verification")
-	tokens, tokenErr := w.buildSentinelToken(ctx, "authorize_continue")
+	tokens, tokenErr := w.buildSentinelToken(ctx, "authorize_continue", "email-verification")
 	if tokenErr != nil {
 		return nil, fmt.Errorf("validate_otp_http_%d; sentinel fallback failed: %w", status, tokenErr)
 	}
@@ -658,8 +676,8 @@ func (w *registerWorker) authSessionWorkspaceID() string {
 	return clean(workspaces[0]["id"])
 }
 
-func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*sentinelTokens, error) {
-	tokens, err := w.buildSentinelTokenWithSDK(ctx, flow)
+func (w *registerWorker) buildSentinelToken(ctx context.Context, flow, pageURL string) (*sentinelTokens, error) {
+	tokens, err := w.buildSentinelTokenWithSDK(ctx, flow, pageURL)
 	if err == nil {
 		return tokens, nil
 	}
@@ -673,7 +691,7 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*
 	return nil, err
 }
 
-func (w *registerWorker) buildSentinelTokenWithSDK(ctx context.Context, flow string) (*sentinelTokens, error) {
+func (w *registerWorker) buildSentinelTokenWithSDK(ctx context.Context, flow, pageURL string) (*sentinelTokens, error) {
 	nodePath := strings.TrimSpace(os.Getenv("NODE_BINARY"))
 	var err error
 	if nodePath == "" {
@@ -695,6 +713,7 @@ func (w *registerWorker) buildSentinelTokenWithSDK(ctx context.Context, flow str
 		"sec_ch_ua":  registerSecCHUA,
 		"loader_url": registerSentinelSDKLoader,
 		"proxy":      clean(w.config["proxy"]),
+		"page_url":   strings.TrimSpace(pageURL),
 	}
 	body, err := compactJSONBytes(payload)
 	if err != nil {
