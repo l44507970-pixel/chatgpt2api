@@ -9,10 +9,14 @@ from typing import Any
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 DEFAULT_FILE = DATA_DIR / "mail_domain_reputation.json"
+LOW_SUCCESS_MIN_ATTEMPTS = 5
+LOW_SUCCESS_RATE = 0.2
 
 HARD_FAILURE_MARKERS = (
     "unsupported_email",
     "account_creation_failed",
+    "registration_disallowed",
+    "Sorry, we cannot create your account with the given information.",
     "The email you provided is not supported",
     "Failed to create account. Please try again.",
 )
@@ -61,6 +65,24 @@ def classify_failure(reason: str) -> str:
     return "soft"
 
 
+def _update_success_rate(record: dict[str, Any]) -> None:
+    success = int(record.get("success") or 0)
+    hard_fail = int(record.get("hard_fail") or 0)
+    soft_fail = int(record.get("soft_fail") or 0)
+    attempts = success + hard_fail + soft_fail
+    record["attempts"] = attempts
+    record["success_rate"] = round(success / attempts, 4) if attempts else 0
+
+
+def _should_disable_for_low_success(record: dict[str, Any]) -> bool:
+    attempts = int(record.get("attempts") or 0)
+    if attempts < LOW_SUCCESS_MIN_ATTEMPTS:
+        return False
+    success_rate = float(record.get("success_rate") or 0)
+    failures = int(record.get("hard_fail") or 0) + int(record.get("soft_fail") or 0)
+    return failures >= LOW_SUCCESS_MIN_ATTEMPTS - 1 and success_rate < LOW_SUCCESS_RATE
+
+
 class DomainReputationStore:
     def __init__(self, file_path: Path = DEFAULT_FILE):
         self.file_path = Path(file_path)
@@ -88,6 +110,9 @@ class DomainReputationStore:
         record.setdefault("hard_fail", 0)
         record.setdefault("soft_fail", 0)
         record.setdefault("consecutive_fail", 0)
+        record.setdefault("attempts", 0)
+        record.setdefault("success_rate", 0)
+        record.setdefault("disabled_reason", "")
         record.setdefault("disabled", False)
         return record
 
@@ -101,6 +126,8 @@ class DomainReputationStore:
             record["success"] = int(record.get("success") or 0) + 1
             record["consecutive_fail"] = 0
             record["disabled"] = False
+            record["disabled_reason"] = ""
+            _update_success_rate(record)
             record["last_success_at"] = _now()
             self._save_locked(data)
             return dict(record)
@@ -117,9 +144,14 @@ class DomainReputationStore:
             if bucket == "hard":
                 record["hard_fail"] = int(record.get("hard_fail") or 0) + 1
                 record["disabled"] = True
+                record["disabled_reason"] = "hard_failure"
             else:
                 record["soft_fail"] = int(record.get("soft_fail") or 0) + 1
             record["consecutive_fail"] = int(record.get("consecutive_fail") or 0) + 1
+            _update_success_rate(record)
+            if _should_disable_for_low_success(record):
+                record["disabled"] = True
+                record["disabled_reason"] = "low_success_rate"
             record["last_failure_at"] = _now()
             record["last_failure_reason"] = str(reason or "")[:500]
             self._save_locked(data)

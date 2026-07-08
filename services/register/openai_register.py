@@ -3,9 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import random
 import secrets
+import shutil
 import string
+import subprocess
 import threading
 import time
 import uuid
@@ -49,6 +52,8 @@ platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
 platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
 platform_oauth_audience = "https://api.openai.com/v1"
 platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
+sentinel_sdk_loader_url = "https://sentinel.openai.com/backend-api/sentinel/sdk.js"
+sentinel_helper_file = base_dir.parents[1] / "scripts" / "sentinel_token_helper.mjs"
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -294,7 +299,63 @@ class SentinelTokenGenerator:
         return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
 
 
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> tuple:
+def _node_executable() -> str:
+    return str(os.environ.get("NODE_BINARY") or shutil.which("node") or "").strip()
+
+
+def _build_sentinel_token_with_sdk(device_id: str, flow: str) -> tuple[str, str]:
+    node = _node_executable()
+    if not node:
+        raise RuntimeError("sentinel_sdk_helper_node_missing")
+    helper = Path(os.environ.get("CHATGPT2API_SENTINEL_HELPER") or sentinel_helper_file)
+    if not helper.exists():
+        raise RuntimeError(f"sentinel_sdk_helper_missing: {helper}")
+    need_so = flow == "oauth_create_account"
+    payload = {
+        "flow": flow,
+        "device_id": device_id,
+        "need_so": need_so,
+        "user_agent": user_agent,
+        "sec_ch_ua": sec_ch_ua,
+        "loader_url": sentinel_sdk_loader_url,
+        "proxy": str(config.get("proxy") or "").strip(),
+    }
+    env = os.environ.copy()
+    proxy = str(config.get("proxy") or "").strip()
+    if proxy:
+        env.setdefault("HTTPS_PROXY", proxy)
+        env.setdefault("HTTP_PROXY", proxy)
+    timeout = 80 if need_so else 45
+    proc = subprocess.run(
+        [node, str(helper)],
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:500]
+        raise RuntimeError(f"sentinel_sdk_helper_failed_{proc.returncode}{': ' + detail if detail else ''}")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("sentinel_sdk_helper_invalid_json") from exc
+    token = str(data.get("token") or "").strip()
+    so_token = str(data.get("so_token") or "").strip()
+    if not token:
+        raise RuntimeError("sentinel_sdk_helper_empty_token")
+    if need_so:
+        log(
+            "Sentinel SDK token 已生成: "
+            f"flow={flow}, sdk={data.get('sdk_version') or 'unknown'}, "
+            f"sentinel_len={len(token)}, so_len={len(so_token)}, has_so={bool(so_token)}"
+        )
+    return token, so_token
+
+
+def _build_legacy_sentinel_token(session: requests.Session, device_id: str, flow: str) -> tuple:
     """返回 (sentinel_token_json, so_token) 的元组。so_token 仅在 oauth_create_account flow 时生成。"""
     generator = SentinelTokenGenerator(device_id, user_agent)
     resp = session.post(
@@ -339,6 +400,16 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
     return sentinel_token, so_token
 
 
+def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> tuple:
+    try:
+        return _build_sentinel_token_with_sdk(device_id, flow)
+    except Exception as exc:
+        if os.environ.get("CHATGPT2API_ALLOW_LEGACY_SENTINEL") == "1":
+            log(f"Sentinel SDK helper 失败，按环境变量回退旧逻辑: {exc}", "yellow")
+            return _build_legacy_sentinel_token(session, device_id, flow)
+        raise
+
+
 def _is_socks_proxy(proxy: str) -> bool:
     candidate = str(proxy or "").strip().lower()
     return candidate.startswith("socks5://") or candidate.startswith("socks5h://")
@@ -377,7 +448,7 @@ def validate_otp(session: requests.Session, device_id: str, code: str):
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue")[0]
+    headers["OpenAI-Sentinel-Token"] = build_sentinel_token(session, device_id, "authorize_continue")[0]
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     return resp, error
 
@@ -564,11 +635,37 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"platform_authorize_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         step(index, "platform authorize 完成")
 
+    def _submit_register_email(self, email: str, index: int) -> None:
+        step(index, "开始提交注册邮箱")
+        last_detail = ""
+        for attempt in range(2):
+            headers = self._json_headers(f"{auth_base}/log-in?usernameKind=email")
+            headers["OpenAI-Sentinel-Token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue")[0]
+            resp, error = request_with_local_retry(
+                self.session,
+                "post",
+                f"{auth_base}/api/accounts/authorize/continue",
+                json={"username": {"kind": "email", "value": email}},
+                headers=headers,
+                allow_redirects=False,
+                verify=False,
+            )
+            if resp is not None and resp.status_code == 409 and attempt == 0:
+                last_detail = _response_error_detail(resp)
+                step(index, "注册邮箱提交 invalid_state，重新 authorize 后重试", "yellow")
+                self._platform_authorize(email, index)
+                continue
+            if resp is None or resp.status_code != 200:
+                detail = _response_error_detail(resp) or last_detail
+                raise RuntimeError(error or f"register_email_submit_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+            step(index, "注册邮箱提交完成")
+            return
+
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
         token, _ = build_sentinel_token(self.session, self.device_id, "username_password_create")
-        headers["openai-sentinel-token"] = token
+        headers["OpenAI-Sentinel-Token"] = token
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
@@ -601,10 +698,11 @@ class PlatformRegistrar:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
         st, so_token = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
-        headers["openai-sentinel-token"] = st
-        if so_token:
-            headers["openai-sentinel-so-token"] = so_token
-            step(index, f"create_account 携带 SO token: sentinel_len={len(st)}, so_len={len(so_token)}")
+        headers["OpenAI-Sentinel-Token"] = st
+        if not so_token:
+            raise RuntimeError("create_account_missing_sentinel_so_token")
+        headers["OpenAI-Sentinel-SO-Token"] = so_token
+        step(index, f"create_account 携带 Sentinel 双 token: sentinel_len={len(st)}, so_len={len(so_token)}")
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
@@ -674,7 +772,7 @@ class PlatformRegistrar:
         # 提交邮箱（原样，不带 state）
         def _do_authorize_continue():
             h = _login_json_headers(f"{auth_base}/log-in?usernameKind=email")
-            h["openai-sentinel-token"] = build_sentinel_token(login_session, login_device_id, "authorize_continue")[0]
+            h["OpenAI-Sentinel-Token"] = build_sentinel_token(login_session, login_device_id, "authorize_continue")[0]
             return request_with_local_retry(
                 login_session, "post",
                 f"{auth_base}/api/accounts/authorize/continue",
@@ -716,7 +814,7 @@ class PlatformRegistrar:
         # 密码验证
         step(index, "开始密码校验")
         headers = _login_json_headers(f"{auth_base}/log-in/password")
-        headers["openai-sentinel-token"] = build_sentinel_token(login_session, login_device_id, "password_verify")[0]
+        headers["OpenAI-Sentinel-Token"] = build_sentinel_token(login_session, login_device_id, "password_verify")[0]
         resp, error = request_with_local_retry(login_session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=headers, allow_redirects=False, verify=False)
         if resp is None or resp.status_code != 200:
             login_session.close()
@@ -763,6 +861,7 @@ class PlatformRegistrar:
             password = _random_password()
             first_name, last_name = _random_name()
             self._platform_authorize(email, index)
+            self._submit_register_email(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")

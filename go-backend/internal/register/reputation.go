@@ -29,6 +29,11 @@ var softFailureMarkers = []string{
 	"oauth_token_exchange_failed",
 }
 
+const (
+	lowSuccessMinAttempts = 5
+	lowSuccessRate        = 0.2
+)
+
 type domainReputationStore struct {
 	path string
 	mu   sync.Mutex
@@ -90,6 +95,8 @@ func (s *domainReputationStore) RecordSuccess(provider, domain string) map[strin
 	record["success"] = intValue(record["success"], 0) + 1
 	record["consecutive_fail"] = 0
 	record["disabled"] = false
+	record["disabled_reason"] = ""
+	updateSuccessRate(record)
 	record["last_success_at"] = nowISO()
 	s.saveLocked(data)
 	return copyMap(record)
@@ -109,10 +116,16 @@ func (s *domainReputationStore) RecordFailure(provider, domain, reason string) m
 	if bucket == "hard" {
 		record["hard_fail"] = intValue(record["hard_fail"], 0) + 1
 		record["disabled"] = true
+		record["disabled_reason"] = "hard_failure"
 	} else {
 		record["soft_fail"] = intValue(record["soft_fail"], 0) + 1
 	}
 	record["consecutive_fail"] = intValue(record["consecutive_fail"], 0) + 1
+	updateSuccessRate(record)
+	if shouldDisableForLowSuccess(record) {
+		record["disabled"] = true
+		record["disabled_reason"] = "low_success_rate"
+	}
 	record["last_failure_at"] = nowISO()
 	if len(reason) > 500 {
 		reason = reason[:500]
@@ -227,10 +240,41 @@ func (s *domainReputationStore) recordLocked(data map[string]any, provider, doma
 	if _, ok := record["consecutive_fail"]; !ok {
 		record["consecutive_fail"] = 0
 	}
+	if _, ok := record["attempts"]; !ok {
+		record["attempts"] = 0
+	}
+	if _, ok := record["success_rate"]; !ok {
+		record["success_rate"] = 0.0
+	}
+	if _, ok := record["disabled_reason"]; !ok {
+		record["disabled_reason"] = ""
+	}
 	if _, ok := record["disabled"]; !ok {
 		record["disabled"] = false
 	}
 	return record
+}
+
+func updateSuccessRate(record map[string]any) {
+	success := intValue(record["success"], 0)
+	hardFail := intValue(record["hard_fail"], 0)
+	softFail := intValue(record["soft_fail"], 0)
+	attempts := success + hardFail + softFail
+	record["attempts"] = attempts
+	if attempts == 0 {
+		record["success_rate"] = 0.0
+		return
+	}
+	record["success_rate"] = float64(success) / float64(attempts)
+}
+
+func shouldDisableForLowSuccess(record map[string]any) bool {
+	attempts := intValue(record["attempts"], 0)
+	if attempts < lowSuccessMinAttempts {
+		return false
+	}
+	failures := intValue(record["hard_fail"], 0) + intValue(record["soft_fail"], 0)
+	return failures >= lowSuccessMinAttempts-1 && floatValue(record["success_rate"], 0) < lowSuccessRate
 }
 
 func (s *domainReputationStore) providerDomainsLocked(data map[string]any, provider string) map[string]any {

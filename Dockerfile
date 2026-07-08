@@ -29,14 +29,17 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -ldflags="-s 
 
 FROM --platform=$TARGETPLATFORM nginx:1.29-alpine
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates nodejs tzdata
 
 WORKDIR /app
+
+RUN mkdir -p /app/scripts
 
 COPY --from=go-build /out/chatgpt2api-go /usr/local/bin/chatgpt2api-go
 COPY --from=web-build /src/web/out /usr/share/nginx/html
 COPY go-backend/deploy/nginx.conf /etc/nginx/conf.d/default.conf
 COPY go-backend/deploy/entrypoint.sh /usr/local/bin/chatgpt2api-go-entrypoint
+COPY scripts/sentinel_token_helper.mjs /app/scripts/sentinel_token_helper.mjs
 COPY config.json /app/config.json
 COPY VERSION /app/VERSION
 

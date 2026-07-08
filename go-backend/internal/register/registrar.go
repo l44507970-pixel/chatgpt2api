@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +33,7 @@ const (
 	registerSecCHUA                  = `"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"`
 	registerSecCHUAFullVersionList   = `"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.0.0"`
 	registerSentinelBase             = "https://sentinel.openai.com"
+	registerSentinelSDKLoader        = registerSentinelBase + "/backend-api/sentinel/sdk.js"
 	registerSentinelSDK              = registerSentinelBase + "/sentinel/20260124ceb8/sdk.js"
 	registerSentinelMaxAttempts      = 500000
 	registerSentinelErrorPrefix      = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
@@ -72,6 +75,16 @@ type registerWorker struct {
 type sentinelTokens struct {
 	token   string
 	soToken string
+}
+
+type sentinelSDKHelperResult struct {
+	Token      string `json:"token"`
+	SOToken    string `json:"so_token"`
+	SDKURL     string `json:"sdk_url"`
+	SDKVersion string `json:"sdk_version"`
+	TokenLen   int    `json:"token_len"`
+	SOTokenLen int    `json:"so_token_len"`
+	HasSOToken bool   `json:"has_so_token"`
 }
 
 type sentinelTokenGenerator struct {
@@ -145,6 +158,9 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	if err := w.platformAuthorize(ctx, email); err != nil {
 		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
 	}
+	if err := w.submitRegisterEmail(ctx, email); err != nil {
+		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
+	}
 	if err := w.registerUser(ctx, email, password); err != nil {
 		return nil, &attemptError{Reason: err.Error(), Mailbox: mailbox}
 	}
@@ -204,7 +220,7 @@ func (w *registerWorker) registerUser(ctx context.Context, email, password strin
 	if err != nil {
 		return err
 	}
-	headers["openai-sentinel-token"] = tokens.token
+	headers["OpenAI-Sentinel-Token"] = tokens.token
 	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/user/register", map[string]any{
 		"username": email,
 		"password": password,
@@ -220,6 +236,42 @@ func (w *registerWorker) registerUser(ctx context.Context, email, password strin
 	}
 	w.step("提交注册密码完成")
 	return nil
+}
+
+func (w *registerWorker) submitRegisterEmail(ctx context.Context, email string) error {
+	w.step("开始提交注册邮箱")
+	var lastPayload map[string]any
+	for attempt := 0; attempt < 2; attempt++ {
+		headers := w.jsonHeaders(registerAuthBase + "/log-in?usernameKind=email")
+		tokens, err := w.buildSentinelToken(ctx, "authorize_continue")
+		if err != nil {
+			return err
+		}
+		headers["OpenAI-Sentinel-Token"] = tokens.token
+		status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/authorize/continue", map[string]any{
+			"username": map[string]any{"kind": "email", "value": email},
+		}, headers, false)
+		if err != nil {
+			return err
+		}
+		if status == http.StatusConflict && attempt == 0 {
+			lastPayload = payload
+			w.step("注册邮箱提交 invalid_state，重新 authorize 后重试")
+			if err := w.platformAuthorize(ctx, email); err != nil {
+				return err
+			}
+			continue
+		}
+		if status != http.StatusOK {
+			if len(payload) == 0 {
+				payload = lastPayload
+			}
+			return fmt.Errorf("register_email_submit_http_%d%s", status, responseDetail(payload))
+		}
+		w.step("注册邮箱提交完成")
+		return nil
+	}
+	return fmt.Errorf("register_email_submit_failed")
 }
 
 func (w *registerWorker) sendOTP(ctx context.Context) error {
@@ -251,15 +303,17 @@ func (w *registerWorker) createAccount(ctx context.Context, name, birthdate stri
 	if err != nil {
 		return err
 	}
-	headers["openai-sentinel-token"] = tokens.token
+	headers["OpenAI-Sentinel-Token"] = tokens.token
 	if tokens.soToken != "" {
-		headers["openai-sentinel-so-token"] = tokens.soToken
-		w.service.appendLog(
-			fmt.Sprintf("[任务%d] create_account 携带 SO token: sentinel_len=%d, so_len=%d",
-				w.index, len(tokens.token), len(tokens.soToken)),
-			"info",
-		)
+		headers["OpenAI-Sentinel-SO-Token"] = tokens.soToken
+	} else {
+		return fmt.Errorf("create_account_missing_sentinel_so_token")
 	}
+	w.service.appendLog(
+		fmt.Sprintf("[任务%d] create_account 携带 Sentinel 双 token: sentinel_len=%d, so_len=%d",
+			w.index, len(tokens.token), len(tokens.soToken)),
+		"info",
+	)
 	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/create_account", map[string]any{
 		"name":      name,
 		"birthdate": birthdate,
@@ -355,7 +409,7 @@ func (w *registerWorker) loginAndExchangeTokens(ctx context.Context, email, pass
 	if err != nil {
 		return nil, err
 	}
-	headers["openai-sentinel-token"] = st.token
+	headers["OpenAI-Sentinel-Token"] = st.token
 	status, payload, err = w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/password/verify", map[string]any{
 		"password": password,
 	}, headers, false)
@@ -444,7 +498,7 @@ func (w *registerWorker) submitLoginEmail(ctx context.Context, email string) (in
 	if err != nil {
 		return 0, nil, err
 	}
-	headers["openai-sentinel-token"] = tokens.token
+	headers["OpenAI-Sentinel-Token"] = tokens.token
 	return w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/authorize/continue", map[string]any{
 		"username": map[string]any{"kind": "email", "value": email},
 	}, headers, false)
@@ -502,7 +556,7 @@ func (w *registerWorker) validateOTPCode(ctx context.Context, code string) (map[
 	if tokenErr != nil {
 		return nil, fmt.Errorf("validate_otp_http_%d; sentinel fallback failed: %w", status, tokenErr)
 	}
-	headers["openai-sentinel-token"] = tokens.token
+	headers["OpenAI-Sentinel-Token"] = tokens.token
 	status, payload, err = w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/email-otp/validate", map[string]any{"code": code}, headers, true)
 	if err != nil {
 		return nil, err
@@ -605,6 +659,112 @@ func (w *registerWorker) authSessionWorkspaceID() string {
 }
 
 func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*sentinelTokens, error) {
+	tokens, err := w.buildSentinelTokenWithSDK(ctx, flow)
+	if err == nil {
+		return tokens, nil
+	}
+	if os.Getenv("CHATGPT2API_ALLOW_LEGACY_SENTINEL") == "1" {
+		w.service.appendLog(
+			fmt.Sprintf("[任务%d] Sentinel SDK helper 失败，按环境变量回退旧逻辑: %v", w.index, err),
+			"yellow",
+		)
+		return w.buildLegacySentinelToken(ctx, flow)
+	}
+	return nil, err
+}
+
+func (w *registerWorker) buildSentinelTokenWithSDK(ctx context.Context, flow string) (*sentinelTokens, error) {
+	nodePath := strings.TrimSpace(os.Getenv("NODE_BINARY"))
+	var err error
+	if nodePath == "" {
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			return nil, fmt.Errorf("sentinel_sdk_helper_node_missing")
+		}
+	}
+	helperPath, err := sentinelHelperPath()
+	if err != nil {
+		return nil, err
+	}
+	needSO := flow == "oauth_create_account"
+	payload := map[string]any{
+		"flow":       flow,
+		"device_id":  w.deviceID,
+		"need_so":    needSO,
+		"user_agent": registerUserAgent,
+		"sec_ch_ua":  registerSecCHUA,
+		"loader_url": registerSentinelSDKLoader,
+		"proxy":      clean(w.config["proxy"]),
+	}
+	body, err := compactJSONBytes(payload)
+	if err != nil {
+		return nil, err
+	}
+	timeout := 45 * time.Second
+	if needSO {
+		timeout = 80 * time.Second
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, nodePath, helperPath)
+	cmd.Stdin = bytes.NewReader(body)
+	env := os.Environ()
+	if proxy := clean(w.config["proxy"]); proxy != "" {
+		env = append(env, "HTTPS_PROXY="+proxy, "HTTP_PROXY="+proxy)
+	}
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if cmdCtx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("sentinel_sdk_helper_timeout")
+	}
+	if err != nil {
+		detail := strings.TrimSpace(string(output))
+		if len(detail) > 500 {
+			detail = detail[:500]
+		}
+		if detail != "" {
+			return nil, fmt.Errorf("sentinel_sdk_helper_failed: %s", detail)
+		}
+		return nil, fmt.Errorf("sentinel_sdk_helper_failed: %w", err)
+	}
+	var result sentinelSDKHelperResult
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, fmt.Errorf("sentinel_sdk_helper_invalid_json: %w", err)
+	}
+	result.Token = strings.TrimSpace(result.Token)
+	result.SOToken = strings.TrimSpace(result.SOToken)
+	if result.Token == "" {
+		return nil, fmt.Errorf("sentinel_sdk_helper_empty_token")
+	}
+	if needSO {
+		w.service.appendLog(
+			fmt.Sprintf("[任务%d] Sentinel SDK token 已生成: flow=%s, sdk=%s, sentinel_len=%d, so_len=%d, has_so=%v",
+				w.index, flow, firstNonEmpty(result.SDKVersion, "unknown"), len(result.Token), len(result.SOToken), result.SOToken != ""),
+			"info",
+		)
+	}
+	return &sentinelTokens{token: result.Token, soToken: result.SOToken}, nil
+}
+
+func sentinelHelperPath() (string, error) {
+	candidates := []string{}
+	if configured := strings.TrimSpace(os.Getenv("CHATGPT2API_SENTINEL_HELPER")); configured != "" {
+		candidates = append(candidates, configured)
+	}
+	candidates = append(candidates,
+		"scripts/sentinel_token_helper.mjs",
+		"./scripts/sentinel_token_helper.mjs",
+		"/app/scripts/sentinel_token_helper.mjs",
+	)
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("sentinel_sdk_helper_missing")
+}
+
+func (w *registerWorker) buildLegacySentinelToken(ctx context.Context, flow string) (*sentinelTokens, error) {
 	generator := newSentinelTokenGenerator(w.deviceID, registerUserAgent)
 	reqsToken := generator.generateRequirementsToken()
 	reqPayload := map[string]any{"p": reqsToken, "id": w.deviceID, "flow": flow}
@@ -639,23 +799,24 @@ func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (*
 			keys = append(keys, k)
 		}
 		w.service.appendLog(
-			fmt.Sprintf("[任务%d] Sentinel resp keys=%v, has_so=%v, so=%v",
-				w.index, keys, payload["so"] != nil, payload["so"]),
+			fmt.Sprintf("[任务%d] Sentinel legacy resp keys=%v, has_so=%v",
+				w.index, keys, payload["so"] != nil),
 			"info",
 		)
 		soData := asMap(payload["so"])
-		if boolValue(soData["required"], false) && clean(soData["collector_dx"]) != "" {
+		collectorDX := clean(soData["collector_dx"])
+		if boolValue(soData["required"], false) && collectorDX != "" {
 			// 按官方前端逻辑等待 5000ms 采集 observer 数据
 			time.Sleep(5000 * time.Millisecond)
-			soToken = generateSOTokenFromCollectorDX(clean(soData["collector_dx"]), reqsToken)
+			soToken = generateSOTokenFromCollectorDX(collectorDX, reqsToken)
 			w.service.appendLog(
-				fmt.Sprintf("[任务%d] Sentinel SO token 已生成: collector_dx_len=%d, has_snapshot=%v",
-					w.index, len(soToken), clean(soData["snapshot_dx"]) != ""),
+				fmt.Sprintf("[任务%d] Sentinel legacy SO token 已生成: collector_dx_len=%d, so_len=%d, has_snapshot=%v",
+					w.index, len(collectorDX), len(soToken), clean(soData["snapshot_dx"]) != ""),
 				"info",
 			)
 		} else {
 			w.service.appendLog(
-				fmt.Sprintf("[任务%d] Sentinel so 字段无有效的 collector_dx（required=%v, has_collector=%v）", w.index, soData["required"], clean(soData["collector_dx"]) != ""),
+				fmt.Sprintf("[任务%d] Sentinel so 字段无有效的 collector_dx（required=%v, has_collector=%v）", w.index, soData["required"], collectorDX != ""),
 				"info",
 			)
 		}
@@ -1235,8 +1396,12 @@ func randomChoiceInt(values []int) int {
 func xorDecrypt(data, key string) string {
 	var buf strings.Builder
 	kl := len(key)
-	if kl == 0 { return data }
-	for i := 0; i < len(data); i++ { buf.WriteByte(data[i] ^ key[i%kl]) }
+	if kl == 0 {
+		return data
+	}
+	for i := 0; i < len(data); i++ {
+		buf.WriteByte(data[i] ^ key[i%kl])
+	}
 	return buf.String()
 }
 
@@ -1252,22 +1417,122 @@ func newSentinelObsVM() *sentinelObsVM {
 	r := vm.regs
 	r["1"] = func(a []any) { vm.set(a, xorDecrypt(fmt.Sprint(vm.get(a[0])), fmt.Sprint(vm.get(a[1])))) }
 	r["2"] = func(a []any) { vm.set(a, vm.get(a[1])) }
-	r["5"] = func(a []any) { v := vm.get(a[1]); switch e := vm.get(a[0]).(type) { case []any: vm.set(a, append(e, v)); default: vm.set(a, fmt.Sprint(e)+fmt.Sprint(v)) } }
-	r["6"] = func(a []any) { b := vm.get(a[1]); idx := vm.get(a[2]); switch bb := b.(type) { case string: if n, ok := toInt(idx); ok && n >= 0 && n < len(bb) { vm.set(a, string(bb[n])) }; case []any: if n, ok := toInt(idx); ok && n >= 0 && n < len(bb) { vm.set(a, bb[n]) } } }
-	r["7"] = func(a []any) { fn := vm.get(a[0]); fa := make([]any, len(a)-1); for i := 1; i < len(a); i++ { fa[i-1] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } }
+	r["5"] = func(a []any) {
+		v := vm.get(a[1])
+		switch e := vm.get(a[0]).(type) {
+		case []any:
+			vm.set(a, append(e, v))
+		default:
+			vm.set(a, fmt.Sprint(e)+fmt.Sprint(v))
+		}
+	}
+	r["6"] = func(a []any) {
+		b := vm.get(a[1])
+		idx := vm.get(a[2])
+		switch bb := b.(type) {
+		case string:
+			if n, ok := toInt(idx); ok && n >= 0 && n < len(bb) {
+				vm.set(a, string(bb[n]))
+			}
+		case []any:
+			if n, ok := toInt(idx); ok && n >= 0 && n < len(bb) {
+				vm.set(a, bb[n])
+			}
+		}
+	}
+	r["7"] = func(a []any) {
+		fn := vm.get(a[0])
+		fa := make([]any, len(a)-1)
+		for i := 1; i < len(a); i++ {
+			fa[i-1] = vm.get(a[i])
+		}
+		if f, ok := fn.(func([]any)); ok {
+			f(fa)
+		}
+	}
 	r["8"] = func(a []any) { vm.set(a, vm.get(a[1])) }
 	r["12"] = func(a []any) { vm.set(a, r) }
-	r["13"] = func(a []any) { func() { defer func() { if rc := recover(); rc != nil { vm.set(a, fmt.Sprint(rc)) } }(); fn := vm.get(a[1]); fa := make([]any, len(a)-2); for i := 2; i < len(a); i++ { fa[i-2] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } }() }
-	r["14"] = func(a []any) { var res any; if json.Unmarshal([]byte(fmt.Sprint(vm.get(a[1]))), &res) == nil { vm.set(a, res) } }
+	r["13"] = func(a []any) {
+		func() {
+			defer func() {
+				if rc := recover(); rc != nil {
+					vm.set(a, fmt.Sprint(rc))
+				}
+			}()
+			fn := vm.get(a[1])
+			fa := make([]any, len(a)-2)
+			for i := 2; i < len(a); i++ {
+				fa[i-2] = vm.get(a[i])
+			}
+			if f, ok := fn.(func([]any)); ok {
+				f(fa)
+			}
+		}()
+	}
+	r["14"] = func(a []any) {
+		var res any
+		if json.Unmarshal([]byte(fmt.Sprint(vm.get(a[1]))), &res) == nil {
+			vm.set(a, res)
+		}
+	}
 	r["15"] = func(a []any) { d, _ := compactJSONBytes(vm.get(a[1])); vm.set(a, string(d)) }
-	r["17"] = func(a []any) { fn := vm.get(a[1]); fa := make([]any, len(a)-2); for i := 2; i < len(a); i++ { fa[i-2] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } }
+	r["17"] = func(a []any) {
+		fn := vm.get(a[1])
+		fa := make([]any, len(a)-2)
+		for i := 2; i < len(a); i++ {
+			fa[i-2] = vm.get(a[i])
+		}
+		if f, ok := fn.(func([]any)); ok {
+			f(fa)
+		}
+	}
 	r["18"] = func(a []any) { d, _ := base64.StdEncoding.DecodeString(fmt.Sprint(vm.get(a[0]))); vm.set(a, string(d)) }
 	r["19"] = func(a []any) { vm.set(a, base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(vm.get(a[0]))))) }
-	r["20"] = func(a []any) { if fmt.Sprint(vm.get(a[0])) == fmt.Sprint(vm.get(a[1])) { fn := vm.get(a[2]); fa := make([]any, len(a)-3); for i := 3; i < len(a); i++ { fa[i-3] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } } }
-	r["22"] = func(a []any) { if sl, ok := vm.get(a[1]).([]any); ok { sq := vm.queue; vm.queue = make([]any, len(sl)); copy(vm.queue, sl); vm.run(); vm.set(a, fmt.Sprint(vm.counter)); vm.queue = sq } }
-	r["23"] = func(a []any) { if vm.get(a[0]) != nil { fn := vm.get(a[1]); fa := make([]any, len(a)-2); for i := 2; i < len(a); i++ { fa[i-2] = vm.get(a[i]) }; if f, ok := fn.(func([]any)); ok { f(fa) } } }
-	r["24"] = func(a []any) { obj, method := vm.get(a[1]), vm.get(a[2]); vm.set(a, func(fa []any) { if o, ok := obj.(string); ok && fmt.Sprint(method) == "indexOf" { vm.set(a, strings.Index(o, fmt.Sprint(fa[0]))) } }) }
-	for _, op := range []string{"25","26","27","28"} { r[op] = func(a []any) {} }
+	r["20"] = func(a []any) {
+		if fmt.Sprint(vm.get(a[0])) == fmt.Sprint(vm.get(a[1])) {
+			fn := vm.get(a[2])
+			fa := make([]any, len(a)-3)
+			for i := 3; i < len(a); i++ {
+				fa[i-3] = vm.get(a[i])
+			}
+			if f, ok := fn.(func([]any)); ok {
+				f(fa)
+			}
+		}
+	}
+	r["22"] = func(a []any) {
+		if sl, ok := vm.get(a[1]).([]any); ok {
+			sq := vm.queue
+			vm.queue = make([]any, len(sl))
+			copy(vm.queue, sl)
+			vm.run()
+			vm.set(a, fmt.Sprint(vm.counter))
+			vm.queue = sq
+		}
+	}
+	r["23"] = func(a []any) {
+		if vm.get(a[0]) != nil {
+			fn := vm.get(a[1])
+			fa := make([]any, len(a)-2)
+			for i := 2; i < len(a); i++ {
+				fa[i-2] = vm.get(a[i])
+			}
+			if f, ok := fn.(func([]any)); ok {
+				f(fa)
+			}
+		}
+	}
+	r["24"] = func(a []any) {
+		obj, method := vm.get(a[1]), vm.get(a[2])
+		vm.set(a, func(fa []any) {
+			if o, ok := obj.(string); ok && fmt.Sprint(method) == "indexOf" {
+				vm.set(a, strings.Index(o, fmt.Sprint(fa[0])))
+			}
+		})
+	}
+	for _, op := range []string{"25", "26", "27", "28"} {
+		r[op] = func(a []any) {}
+	}
 	r["29"] = func(a []any) { av, _ := toFloat(vm.get(a[1])); bv, _ := toFloat(vm.get(a[2])); vm.set(a, av < bv) }
 	r["33"] = func(a []any) { av, _ := toFloat(vm.get(a[1])); bv, _ := toFloat(vm.get(a[2])); vm.set(a, av*bv) }
 	r["34"] = func(a []any) { vm.set(a, vm.get(a[1])) }
@@ -1276,21 +1541,29 @@ func newSentinelObsVM() *sentinelObsVM {
 
 func (vm *sentinelObsVM) get(key any) any {
 	switch k := key.(type) {
-	case string: return vm.regs[k]
-	case float64: return vm.regs[fmt.Sprint(int(k))]
-	default: return vm.regs[fmt.Sprint(k)]
+	case string:
+		return vm.regs[k]
+	case float64:
+		return vm.regs[fmt.Sprint(int(k))]
+	default:
+		return vm.regs[fmt.Sprint(k)]
 	}
 }
 
 func (vm *sentinelObsVM) set(args []any, val any) {
-	if len(args) > 0 { vm.regs[fmt.Sprint(args[0])] = val }
+	if len(args) > 0 {
+		vm.regs[fmt.Sprint(args[0])] = val
+	}
 }
 
 func (vm *sentinelObsVM) run() {
 	for len(vm.queue) > 0 {
-		inst := vm.queue[0]; vm.queue = vm.queue[1:]
+		inst := vm.queue[0]
+		vm.queue = vm.queue[1:]
 		if ia, ok := inst.([]any); ok && len(ia) > 0 {
-			if fn, ok := vm.regs[fmt.Sprint(ia[0])].(func([]any)); ok { fn(ia) }
+			if fn, ok := vm.regs[fmt.Sprint(ia[0])].(func([]any)); ok {
+				fn(ia)
+			}
 		}
 		vm.counter++
 	}
@@ -1298,50 +1571,98 @@ func (vm *sentinelObsVM) run() {
 
 func generateSOTokenFromCollectorDX(collectorDX, proofToken string) string {
 	raw, err := base64.StdEncoding.DecodeString(collectorDX)
-	if err != nil { return "" }
+	if err != nil {
+		return ""
+	}
 	decrypted := xorDecrypt(string(raw), proofToken)
 	var program []any
-	if json.Unmarshal([]byte(decrypted), &program) != nil { return "" }
+	if json.Unmarshal([]byte(decrypted), &program) != nil {
+		return ""
+	}
 	vm := newSentinelObsVM()
 	vm.regs["rt"] = proofToken
 	ch := make(chan string, 1)
-	vm.regs["3"] = func(a []any) { if !vm.finished { vm.finished = true; ch <- base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(vm.get(a[0])))) } }
-	vm.regs["4"] = func(a []any) { if !vm.finished { vm.finished = true; ch <- base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(vm.get(a[0])))) } }
-	vm.regs["30"] = func(a []any) {
-		fnName := fmt.Sprint(a[0]); pn := a[1:]; ac := len(pn) - 1; body := a[len(a)-1]
-		vm.regs[fnName] = func(ca []any) {
-			saved := map[string]any{}
-			for k, v := range vm.regs { saved[k] = v }
-			for i := 0; i < ac && i < len(ca); i++ { vm.regs[fmt.Sprint(pn[i])] = ca[i] }
-			if bl, ok := body.([]any); ok { sq := vm.queue; vm.queue = make([]any, len(bl)); copy(vm.queue, bl); vm.run(); vm.queue = sq }
-			for k := range vm.regs { if _, ok := saved[k]; !ok { delete(vm.regs, k) } }
-			for k, v := range saved { vm.regs[k] = v }
+	vm.regs["3"] = func(a []any) {
+		if !vm.finished {
+			vm.finished = true
+			ch <- base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(vm.get(a[0]))))
 		}
 	}
-	vm.queue = make([]any, len(program)); copy(vm.queue, program)
+	vm.regs["4"] = func(a []any) {
+		if !vm.finished {
+			vm.finished = true
+			ch <- base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(vm.get(a[0]))))
+		}
+	}
+	vm.regs["30"] = func(a []any) {
+		fnName := fmt.Sprint(a[0])
+		pn := a[1:]
+		ac := len(pn) - 1
+		body := a[len(a)-1]
+		vm.regs[fnName] = func(ca []any) {
+			saved := map[string]any{}
+			for k, v := range vm.regs {
+				saved[k] = v
+			}
+			for i := 0; i < ac && i < len(ca); i++ {
+				vm.regs[fmt.Sprint(pn[i])] = ca[i]
+			}
+			if bl, ok := body.([]any); ok {
+				sq := vm.queue
+				vm.queue = make([]any, len(bl))
+				copy(vm.queue, bl)
+				vm.run()
+				vm.queue = sq
+			}
+			for k := range vm.regs {
+				if _, ok := saved[k]; !ok {
+					delete(vm.regs, k)
+				}
+			}
+			for k, v := range saved {
+				vm.regs[k] = v
+			}
+		}
+	}
+	vm.queue = make([]any, len(program))
+	copy(vm.queue, program)
 	vm.run()
 	select {
-	case result := <-ch: return result
-	case <-time.After(500 * time.Millisecond): return base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%d", vm.counter)))
+	case result := <-ch:
+		return result
+	case <-time.After(500 * time.Millisecond):
+		return base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%d", vm.counter)))
 	}
 }
 
 func toInt(v any) (int, bool) {
 	switch v := v.(type) {
-	case float64: return int(v), true
-	case int: return v, true
-	case json.Number: n, e := v.Int64(); return int(n), e == nil
-	case string: n, e := strconv.Atoi(v); return n, e == nil
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case json.Number:
+		n, e := v.Int64()
+		return int(n), e == nil
+	case string:
+		n, e := strconv.Atoi(v)
+		return n, e == nil
 	}
 	return 0, false
 }
 
 func toFloat(v any) (float64, bool) {
 	switch v := v.(type) {
-	case float64: return v, true
-	case int: return float64(v), true
-	case json.Number: n, e := v.Float64(); return n, e == nil
-	case string: n, e := strconv.ParseFloat(v, 64); return n, e == nil
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case json.Number:
+		n, e := v.Float64()
+		return n, e == nil
+	case string:
+		n, e := strconv.ParseFloat(v, 64)
+		return n, e == nil
 	}
 	return 0, false
 }

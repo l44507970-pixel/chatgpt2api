@@ -14,6 +14,9 @@ func TestDomainReputationRecordsHardSoftAndSuccess(t *testing.T) {
 	if disallowed["bucket"] != "hard" || disallowed["disabled"] != true || disallowed["disabled_changed"] != true {
 		t.Fatalf("registration_disallowed failure record = %#v", disallowed)
 	}
+	if disallowed["disabled_reason"] != "hard_failure" {
+		t.Fatalf("registration_disallowed disabled_reason = %#v", disallowed)
+	}
 
 	soft := store.RecordFailure("yyds_mail", "soft.example", "等待注册验证码超时")
 	if soft["bucket"] != "soft" || soft["disabled"] == true {
@@ -35,6 +38,25 @@ func TestDomainReputationRecordsHardSoftAndSuccess(t *testing.T) {
 		if preferred[i] != wantPreferred[i] {
 			t.Fatalf("preferred domains = %#v, want %#v", preferred, wantPreferred)
 		}
+	}
+}
+
+func TestDomainReputationDisablesLowSuccessRate(t *testing.T) {
+	store := newDomainReputationStore(t.TempDir() + "/mail_domain_reputation.json")
+
+	store.RecordSuccess("yyds_mail", "weak.example")
+	for i := 0; i < 4; i++ {
+		record := store.RecordFailure("yyds_mail", "weak.example", "等待注册验证码超时")
+		if i < 3 && record["disabled"] == true {
+			t.Fatalf("domain disabled too early after failure %d: %#v", i+1, record)
+		}
+	}
+	record := store.RecordFailure("yyds_mail", "weak.example", "等待注册验证码超时")
+	if record["disabled"] != true || record["disabled_reason"] != "low_success_rate" {
+		t.Fatalf("low success record = %#v", record)
+	}
+	if got := floatValue(record["success_rate"], 0); got >= lowSuccessRate {
+		t.Fatalf("success_rate = %v, want below %v", got, lowSuccessRate)
 	}
 }
 

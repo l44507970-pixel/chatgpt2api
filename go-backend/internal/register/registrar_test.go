@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -156,5 +158,21 @@ func TestCloudflareChallengePayloadRecognizesAdditionalMarkers(t *testing.T) {
 		if !isCloudflareChallengePayload(map[string]any{"body": body}) {
 			t.Fatalf("expected challenge marker in %q", body)
 		}
+	}
+}
+
+func TestSentinelHelperPathUsesConfiguredFile(t *testing.T) {
+	helper := filepath.Join(t.TempDir(), "sentinel_token_helper.mjs")
+	if err := os.WriteFile(helper, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CHATGPT2API_SENTINEL_HELPER", helper)
+
+	got, err := sentinelHelperPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != helper {
+		t.Fatalf("sentinelHelperPath = %q, want %q", got, helper)
 	}
 }
